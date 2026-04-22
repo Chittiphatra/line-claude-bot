@@ -1,10 +1,11 @@
 """
-LINE Chatbot + Claude API
-=========================
+LINE Chatbot + Claude API (มีความจำแยกตามกรุ๊ป/แชทเดี่ยว)
+============================================================
 บอทแชท LINE ที่ใช้ Claude เป็นสมองในการตอบข้อความ
+มีระบบความจำแยกตามแต่ละกรุ๊ปและแต่ละคน
 
 วิธีติดตั้ง:
-1. pip install flask line-bot-sdk anthropic
+1. pip install flask gunicorn line-bot-sdk anthropic
 2. ตั้งค่า Environment Variables:
    - LINE_CHANNEL_SECRET       (ได้จาก LINE Developers Console)
    - LINE_CHANNEL_ACCESS_TOKEN (ได้จาก LINE Developers Console)
@@ -14,6 +15,8 @@ LINE Chatbot + Claude API
 """
 
 import os
+import time
+from collections import defaultdict
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.messaging import (
@@ -35,6 +38,12 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "ใส�
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "ใส่ api key ที่นี่")
 
 # ============================================================
+# ตั้งค่าความจำ
+# ============================================================
+MAX_HISTORY = 100          # จำได้สูงสุดกี่ข้อความต่อห้อง (20 คู่สนทนา)
+HISTORY_TIMEOUT = 86400    # ลบความจำหลังไม่มีคนคุย (วินาที) = 1 ชั่วโมง
+
+# ============================================================
 # สร้าง App
 # ============================================================
 app = Flask(__name__)
@@ -47,24 +56,71 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ============================================================
+# ระบบความจำ — เก็บประวัติแชทแยกตาม chat_id
+# chat_id = group_id (ถ้าอยู่ในกรุ๊ป) หรือ user_id (ถ้าแชทเดี่ยว)
+# ============================================================
+chat_histories = defaultdict(list)       # {chat_id: [messages]}
+chat_last_active = defaultdict(float)    # {chat_id: timestamp}
+
+# ============================================================
 # System Prompt — ปรับแต่งบุคลิกบอทได้ตรงนี้เลยค่ะ
 # ============================================================
-SYSTEM_PROMPT = """คุณเป็นผู้ช่วยที่เป็นมิตรและพูดภาษาไทย 
-ตอบสั้น กระชับ เข้าใจง่าย เหมาะกับการแชทใน LINE"""
+SYSTEM_PROMPT = """คุณเป็นผู้ช่วยที่เป็นมิตรและพูดภาษาไทย เป็นเพศหญิง เรียกแทนตัวเองว่า "หนู" เรียกผู้ใช้ว่า "พี่" 
+ตอบสั้น กระชับ เข้าใจง่าย อ่อนหวาน ใส่อิโมจิบ้าง เหมาะกับการแชทใน LINE ไม่ต้องบอกว่าตัวเองเป็น claude ให้ปกปิดไว้ เป็นสิ่งที่น่าค้นหา"""
 
 
-def ask_claude(user_message: str) -> str:
-    """ส่งข้อความไปถาม Claude แล้วรับคำตอบกลับมา"""
+def cleanup_old_histories():
+    """ลบประวัติแชทที่ไม่มีคนคุยนานเกิน HISTORY_TIMEOUT"""
+    now = time.time()
+    expired = [
+        chat_id for chat_id, last in chat_last_active.items()
+        if now - last > HISTORY_TIMEOUT
+    ]
+    for chat_id in expired:
+        del chat_histories[chat_id]
+        del chat_last_active[chat_id]
+
+
+def get_chat_id(event):
+    """ดึง chat_id — ใช้ group_id ถ้าอยู่ในกรุ๊ป, ใช้ room_id ถ้าอยู่ในห้อง, ไม่งั้นใช้ user_id"""
+    source = event.source
+    if source.type == "group":
+        return source.group_id
+    elif source.type == "room":
+        return source.room_id
+    else:
+        return source.user_id
+
+
+def ask_claude(chat_id: str, user_message: str) -> str:
+    """ส่งข้อความไปถาม Claude พร้อมประวัติแชท"""
     try:
+        # ลบประวัติเก่าที่หมดอายุ
+        cleanup_old_histories()
+
+        # บันทึกข้อความผู้ใช้
+        chat_histories[chat_id].append({"role": "user", "content": user_message})
+        chat_last_active[chat_id] = time.time()
+
+        # ตัดประวัติเก่าถ้าเยอะเกินไป (เก็บแค่ MAX_HISTORY คู่ล่าสุด)
+        if len(chat_histories[chat_id]) > MAX_HISTORY * 2:
+            chat_histories[chat_id] = chat_histories[chat_id][-(MAX_HISTORY * 2):]
+
+        # ส่งไปถาม Claude พร้อมประวัติทั้งหมด
         response = claude_client.messages.create(
-            model="claude-haiku-4-5-20251001",  # รุ่นประหยัด เร็ว เหมาะกับแชทบอท
+            model="claude-haiku-4-5-20251001",
             max_tokens=1024,
             system=SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": user_message}
-            ],
+            messages=chat_histories[chat_id],
         )
-        return response.content[0].text
+
+        assistant_reply = response.content[0].text
+
+        # บันทึกคำตอบของบอทลงประวัติ
+        chat_histories[chat_id].append({"role": "assistant", "content": assistant_reply})
+
+        return assistant_reply
+
     except Exception as e:
         print(f"Claude API Error: {e}")
         return "ขอโทษค่ะ ตอนนี้ระบบมีปัญหา ลองใหม่อีกครั้งนะคะ 🙏"
@@ -91,9 +147,10 @@ def callback():
 def handle_message(event: MessageEvent):
     """เมื่อมีคนส่งข้อความมา → ถาม Claude → ตอบกลับ"""
     user_message = event.message.text
+    chat_id = get_chat_id(event)
 
-    # ส่งไปถาม Claude
-    reply_text = ask_claude(user_message)
+    # ส่งไปถาม Claude พร้อมประวัติ
+    reply_text = ask_claude(chat_id, user_message)
 
     # ตอบกลับใน LINE
     with ApiClient(configuration) as api_client:
